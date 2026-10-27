@@ -282,5 +282,3 @@ By default, the output directories are created automatically:
 - ERA5 backtest: `case/output/era5_backtest_2025.nc` (or the requested output filename).
 - IFS control: one file per initialization, such as `waveprism_20251112_00.nc`, under `case/output/ifs_control/`.
 - IFS ensemble: one `waveprism_ensemble_YYYYMMDD_00.nc` per initialization, containing the final mean and standard deviation, plus a run-summary CSV under `case/output/ifs_ensemble/`.
-
-Stage-3 wave output contains only `stage3_mu` and `stage3_sigma` for ERA5 backtesting, IFS control forecasting, and IFS ensemble forecasting.
