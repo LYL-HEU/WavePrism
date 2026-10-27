@@ -1,0 +1,3 @@
+# Install a CUDA-compatible PyTorch build separately, then install this project and its dependencies with:
+# python -m pip install -r requirements.txt
+-e .
