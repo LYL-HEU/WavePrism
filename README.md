@@ -100,6 +100,15 @@ case/
 └── output/                           # Forecast outputs; created automatically as needed
 ```
 
+### Download the example case
+
+The example case includes input winds, pretrained model checkpoints, and static geographic features.
+
+- [Download from Baidu Netdisk](https://pan.baidu.com/s/1oLxCZQFg4t8uMoGNfVOKuw?pwd=i6f4)
+- Extraction code: `i6f4`
+
+Extract the archive into the repository root so that the `case/` directory is located alongside `README.md` and `waveprism/`.
+
 ## 3. Main program usage
 
 ### 3.1 Stage 1 — train the expert forecaster
