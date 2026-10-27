@@ -151,8 +151,6 @@ After training, place the compatible Stage-1, Stage-2, and Stage-3 checkpoints i
 
 ### 3.4 ERA5 — hourly backtesting
 
-By default, only Stage-3 final predictions are saved. Use `--stages 1 2 3` to save outputs from all three stages.
-
 This program reads `ERA5_u10v10_YYYYMMDD_HHMM.nc` files from `case/era5/`, constructs hourly historical wind windows, and writes a NetCDF forecast/backtest file. `--year` selects target times in that calendar year; the program skips target times without a complete continuous input history unless `--invalid-history error` is selected.
 
 ```bash
