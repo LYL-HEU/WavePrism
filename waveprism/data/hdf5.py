@@ -261,6 +261,8 @@ def cached_wind_stats(path, train_ids, ocean, cache_path, channels, recompute=Fa
 
 
 class HistoryDataset(Dataset):
+    """Reuse normalized wind histories; preprocess only newly read hours."""
+
     def __init__(self, path, ids, history, static, ocean, mean, std, targets=True):
         self.path, self.ids, self.history = path, np.asarray(ids), history
         self.static, self.ocean = static, ocean
@@ -284,6 +286,12 @@ class HistoryDataset(Dataset):
         state["cached_i"], state["cached_wind"] = None, None
         return state
 
+    def _prepare_wind(self, wind, target_index):
+        if not np.isfinite(wind[:, :, self.ocean]).all():
+            raise ValueError(f'Nonfinite ocean wind in history ending at {target_index}; repair input first.')
+        wind = (wind - self.mean) / self.std
+        return np.nan_to_num(wind, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
     def __getitem__(self, item):
         if self.file is None:
             self.file = h5py.File(self.path, "r")
@@ -291,13 +299,12 @@ class HistoryDataset(Dataset):
         shift = i - self.cached_i if self.cached_i is not None else 0
         if self.cached_wind is not None and 0 < shift <= min(24, self.history - 1):
             new = read_float(self.file["wind"], slice(self.cached_i + 1, i + 1))
+            new = self._prepare_wind(new, i)
             wind = np.concatenate([self.cached_wind[shift:], new], axis=0)
         else:
             wind = read_float(self.file["wind"], slice(i - self.history + 1, i + 1))
+            wind = self._prepare_wind(wind, i)
         self.cached_i, self.cached_wind = i, wind
-        if not np.isfinite(wind[:, :, self.ocean]).all():
-            raise ValueError(f"Nonfinite ocean wind in history ending at {i}; repair input first.")
-        wind = np.nan_to_num((wind - self.mean) / self.std, nan=0.0, posinf=0.0, neginf=0.0)
         out = {
             "wind": torch.from_numpy(wind),
             "static": torch.from_numpy(self.static),

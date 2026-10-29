@@ -23,6 +23,7 @@ class Stage2Config:
     generated_prior_count_scale: float = 20.0
     stage1_architecture: Optional[dict] = None
     stage1_checkpoint_sha256: str = ""
+    generated_statistics_origin: Optional[dict] = None
 
     data_h5: str = r"./global_wave_dataset_base_1h_0p5deg/global_wave_dataset_base_1h_0p5deg.h5"
 

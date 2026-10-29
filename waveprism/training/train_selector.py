@@ -243,9 +243,49 @@ def compute_or_load_wind_stats(cfg, rank):
     return _STAGE1_CONTEXT["mean"].copy(), _STAGE1_CONTEXT["std"].copy()
 
 
-def compute_or_load_generated_statistics(
-    cfg, expert_names, rank, world_size, device, backbone, train_dataset
-):
+def _validate_generated_statistics_cache(cached, cfg, expert_names, ocean_shape,
+                                          lat, lon, array_digest):
+    """Check compatibility, allowing a different historical expert checkpoint.
+
+    Checkpoint/AMP/prior settings and source file paths/timestamps belong to the
+    cache's provenance, not to the decision to reuse this fixed historical prior.
+    TRAIN samples, time/grid/geometry and expert identities must still match.
+    """
+    old_signature = str(cached['signature'].item())
+    origin = json.loads(old_signature)
+    if not isinstance(origin, dict) or origin.get('version') != 1:
+        raise ValueError('Unsupported generated-statistics signature version.')
+    if origin.get('arrays') != array_digest:
+        raise ValueError('TRAIN indices, time, grid or static/ocean geometry differ from the cache.')
+    cached_names = [x.decode('utf-8') if isinstance(x, bytes) else str(x)
+                    for x in np.asarray(cached['expert_names']).reshape(-1)]
+    if cached_names != list(expert_names):
+        raise ValueError('Cached expert identities/order differ from the current experts.')
+    if not np.array_equal(cached['lat'], lat) or not np.array_equal(cached['lon'], lon):
+        raise ValueError('Cached latitude/longitude grid differs from the current grid.')
+    if str(cached['build_split'].item()) != 'train':
+        raise ValueError('Only TRAIN-derived generated statistics may be reused.')
+    if str(cached['expert_source'].item()) != cfg.expert_source:
+        raise ValueError('Cached statistics are not from the expected generated expert source.')
+    source_checkpoint = str(cached['stage1_checkpoint_sha256'].item())
+    if not source_checkpoint or source_checkpoint != origin.get('checkpoint'):
+        raise ValueError('Cached checkpoint provenance is missing or internally inconsistent.')
+    shapes = {'weights': (cfg.num_experts,),
+              'prior_logits': (cfg.num_experts, *ocean_shape),
+              'prior_confidence': (1, *ocean_shape)}
+    for key, expected in shapes.items():
+        value = cached[key]
+        if value.shape != expected or not np.isfinite(value).all():
+            raise ValueError(f'Invalid cached {key}: expected finite array with shape {expected}.')
+        if key == 'weights' and not (value > 0).all():
+            raise ValueError('Cached class weights must be positive.')
+        if key == 'prior_confidence' and not ((value >= 0) & (value <= 1)).all():
+            raise ValueError('Cached prior confidence must lie in [0, 1].')
+    return old_signature, source_checkpoint
+
+
+def compute_or_load_generated_statistics(cfg, expert_names, rank, world_size,
+                                         device, backbone, train_dataset):
     """Exact disjoint TRAIN samples on all ranks; no WW3 wave reads.
 
     Per-expert MAE maps define logits -(MAE-min_MAE)/temperature; confidence
@@ -254,92 +294,76 @@ def compute_or_load_generated_statistics(
     original sqrt_inv_freq formula, now for generated-expert oracle labels.
     """
     ensure_dir(cfg.save_dir)
-    cache_path = Path(cfg.save_dir) / "stage1_generated_train_statistics.npz"
+    cache_path = Path(cfg.save_dir) / 'stage1_generated_train_statistics.npz'
     cfg.expert_skill_prior_npz = str(cache_path)
-    with h5py.File(cfg.data_h5, "r") as f:
-        lat, lon = np.asarray(f["lat"][:]), np.asarray(f["lon"][:])
+    with h5py.File(cfg.data_h5, 'r') as f:
+        lat, lon = np.asarray(f['lat'][:]), np.asarray(f['lon'][:])
     digest = hashlib.sha256()
-    for a in (train_dataset.indices, train_dataset.times, lat, lon, _STAGE1_CONTEXT["geometry"]):
+    for a in (train_dataset.indices, train_dataset.times, lat, lon,
+              _STAGE1_CONTEXT['geometry']):
         digest.update(np.ascontiguousarray(a).tobytes())
     source_stat = Path(cfg.data_h5).stat()
-    signature = json.dumps(
-        dict(
-            version=1,
-            checkpoint=cfg.stage1_checkpoint_sha256,
-            source=str(Path(cfg.data_h5).resolve()),
-            size=source_stat.st_size,
-            mtime_ns=source_stat.st_mtime_ns,
-            arrays=digest.hexdigest(),
-            encoder_amp=cfg.encoder_amp,
-            class_mode=cfg.class_weight_mode,
-            class_min=cfg.class_weight_min,
-            class_max=cfg.class_weight_max,
-            hs_threshold=cfg.train_hs_threshold,
-            margin=cfg.use_margin_label,
-            margin_m=cfg.hard_label_margin,
-            prior_temperature=cfg.generated_prior_temperature_m,
-            prior_count_scale=cfg.generated_prior_count_scale,
-        ),
-        sort_keys=True,
-    )
+    signature = json.dumps(dict(version=1, checkpoint=cfg.stage1_checkpoint_sha256,
+        source=str(Path(cfg.data_h5).resolve()), size=source_stat.st_size,
+        mtime_ns=source_stat.st_mtime_ns, arrays=digest.hexdigest(),
+        encoder_amp=cfg.encoder_amp, class_mode=cfg.class_weight_mode,
+        class_min=cfg.class_weight_min, class_max=cfg.class_weight_max,
+        hs_threshold=cfg.train_hs_threshold, margin=cfg.use_margin_label,
+        margin_m=cfg.hard_label_margin, prior_temperature=cfg.generated_prior_temperature_m,
+        prior_count_scale=cfg.generated_prior_count_scale), sort_keys=True)
     reuse = False
+    cache_error = None
     if rank == 0 and not cfg.recompute_class_weights and cache_path.is_file():
         try:
             with np.load(cache_path) as c:
-                reuse = (
-                    str(c["signature"].item()) == signature
-                    and c["weights"].shape == (cfg.num_experts,)
-                    and c["prior_logits"].shape == (cfg.num_experts, *train_dataset.ocean.shape)
-                    and c["prior_confidence"].shape == (1, *train_dataset.ocean.shape)
-                )
-        except (OSError, ValueError, KeyError):
-            reuse = False
-    flag = torch.tensor([int(reuse)], dtype=torch.int32, device=device)
+                old_signature, source_checkpoint = _validate_generated_statistics_cache(
+                    c, cfg, expert_names, train_dataset.ocean.shape, lat, lon, digest.hexdigest())
+                reuse = True
+                if old_signature != signature:
+                    print('Reusing FIXED historical prior/class weights; original cache is unchanged.', flush=True)
+                    print(f'  cached expert checkpoint : {source_checkpoint}', flush=True)
+                    print(f'  current expert checkpoint: {cfg.stage1_checkpoint_sha256}', flush=True)
+        except (OSError, ValueError, KeyError, TypeError, EOFError) as exc:
+            cache_error = str(exc)
+            print(f'Generated-statistics cache is incompatible: {cache_error}', flush=True)
+    flag = torch.tensor([-1 if cache_error else int(reuse)], dtype=torch.int32, device=device)
     if dist.is_initialized():
         dist.broadcast(flag, src=0)
+    if flag.item() < 0:
+        raise ValueError('Existing generated statistics cannot be reused: '
+            + (cache_error or 'see rank0 cache validation error')
+            + '. Cache was not overwritten. Use --recompute-class-weights to rebuild explicitly.')
     if not flag.item():
         if rank == 0:
-            print(
-                "Computing TRAIN-only prior/class weights from GENERATED Stage-1 experts; first run only.",
-                flush=True,
-            )
+            reason = 'explicit --recompute-class-weights' if cfg.recompute_class_weights else 'cache file is missing'
+            print(f'Computing TRAIN-only generated-expert statistics ({reason}).', flush=True)
         h, w = train_dataset.ocean.shape
         sums = torch.zeros(cfg.num_experts, h, w, dtype=torch.float64, device=device)
         counts = torch.zeros_like(sums)
         oracle_counts = torch.zeros(cfg.num_experts, dtype=torch.float64, device=device)
         subset = torch.utils.data.Subset(train_dataset, range(rank, len(train_dataset), world_size))
-        batches = DataLoader(
-            subset,
-            batch_size=cfg.batch_size_per_gpu,
-            shuffle=False,
-            num_workers=cfg.num_workers,
-            pin_memory=device.type == "cuda",
-        )
-        for batch in tqdm(batches, desc="Generated-expert TRAIN statistics", disable=rank != 0):
+        batches = DataLoader(subset, batch_size=cfg.batch_size_per_gpu,
+            shuffle=False, num_workers=cfg.num_workers, pin_memory=device.type == 'cuda')
+        for batch in tqdm(batches, desc='Generated-expert TRAIN statistics', disable=rank != 0):
             batch = move_batch_to_device(batch, device)
-            _, experts = backbone(batch["x_in"])
-            y = batch["y_sat"]
-            valid = (batch["mask"] > 0.5) & torch.isfinite(y) & torch.isfinite(experts)
+            _, experts = backbone(batch['x_in'])
+            y = batch['y_sat']
+            valid = ((batch['mask'] > .5) & torch.isfinite(y) & torch.isfinite(experts))
             if cfg.train_hs_threshold is not None:
                 valid &= y >= float(cfg.train_hs_threshold)
-            error = torch.where(valid, (experts - y).abs(), torch.zeros_like(experts))
+            error = torch.where(valid, (experts-y).abs(), torch.zeros_like(experts))
             sums += error.double().sum(0)
             counts += valid.double().sum(0)
-            label, _, _ = build_oracle_label(
-                experts,
-                y,
-                batch["mask"],
-                hs_threshold=cfg.train_hs_threshold,
-                use_margin_label=cfg.use_margin_label,
-                hard_label_margin=cfg.hard_label_margin,
-            )
+            label, _, _ = build_oracle_label(experts, y, batch['mask'],
+                hs_threshold=cfg.train_hs_threshold, use_margin_label=cfg.use_margin_label,
+                hard_label_margin=cfg.hard_label_margin)
             labels = label[label >= 0]
             oracle_counts += torch.bincount(labels, minlength=cfg.num_experts).double()
         if dist.is_initialized():
             for value in (sums, counts, oracle_counts):
                 dist.all_reduce(value, op=dist.ReduceOp.SUM)
         if not counts.sum().item() or not oracle_counts.sum().item():
-            raise ValueError("No valid TRAIN observations for generated-expert statistics.")
+            raise ValueError('No valid TRAIN observations for generated-expert statistics.')
         if rank == 0:
             mae = (sums / counts.clamp_min(1)).cpu().numpy()
             support = counts.cpu().numpy()
@@ -348,65 +372,51 @@ def compute_or_load_generated_statistics(
             best = sortable.min(0, keepdims=True)
             observed = np.isfinite(best)
             # Avoid inf arithmetic in cells with no observations.
-            best_finite = np.where(observed, best, 0.0)
-            logits = np.where(
-                valid, -(mae - best_finite) / cfg.generated_prior_temperature_m, -20.0
-            )
-            logits = np.where(observed, np.clip(logits, -20.0, 0.0), 0.0).astype("f4")
+            best_finite = np.where(observed, best, 0.)
+            logits = np.where(valid, -(mae-best_finite)/cfg.generated_prior_temperature_m, -20.)
+            logits = np.where(observed, np.clip(logits, -20., 0.), 0.).astype('f4')
             if cfg.num_experts > 1:
                 second = np.partition(sortable, 1, axis=0)[1:2]
-                gap = np.where(np.isfinite(second), second, best_finite) - best_finite
+                gap = np.where(np.isfinite(second), second, best_finite)-best_finite
             else:
                 gap = np.zeros_like(best_finite)
             nobs = support.max(0, keepdims=True)
-            confidence = (
-                nobs
-                / (nobs + cfg.generated_prior_count_scale)
-                * np.clip(gap / cfg.generated_prior_temperature_m, 0.0, 1.0)
-            )
-            confidence = np.where(observed, confidence, 0.0).astype("f4")
+            confidence = (nobs/(nobs+cfg.generated_prior_count_scale)
+                          * np.clip(gap/cfg.generated_prior_temperature_m, 0., 1.))
+            confidence = np.where(observed, confidence, 0.).astype('f4')
             raw_counts = oracle_counts.cpu().numpy()
-            safe_counts = np.maximum(raw_counts, 1.0)
-            freq = safe_counts / safe_counts.sum()
-            if cfg.class_weight_mode == "none":
+            safe_counts = np.maximum(raw_counts, 1.)
+            freq = safe_counts/safe_counts.sum()
+            if cfg.class_weight_mode == 'none':
                 weights = np.ones_like(freq)
-            elif cfg.class_weight_mode == "inv_freq":
-                weights = 1.0 / freq
-            elif cfg.class_weight_mode == "sqrt_inv_freq":
-                weights = np.sqrt(1.0 / freq)
+            elif cfg.class_weight_mode == 'inv_freq':
+                weights = 1./freq
+            elif cfg.class_weight_mode == 'sqrt_inv_freq':
+                weights = np.sqrt(1./freq)
             else:
-                raise ValueError("Unsupported class_weight_mode: " + cfg.class_weight_mode)
-            weights = np.clip(
-                weights / weights.mean(), cfg.class_weight_min, cfg.class_weight_max
-            ).astype("f4")
+                raise ValueError('Unsupported class_weight_mode: '+cfg.class_weight_mode)
+            weights = np.clip(weights/weights.mean(), cfg.class_weight_min, cfg.class_weight_max).astype('f4')
             # Keep unsupported mean errors identifiable in the saved diagnostics.
-            mae = np.where(valid, mae, np.nan).astype("f4")
-            temporary = str(cache_path) + ".tmp"
-            with open(temporary, "wb") as stream:
-                np.savez(
-                    stream,
-                    signature=signature,
-                    prior_logits=logits,
-                    prior_confidence=confidence,
-                    expert_names=np.asarray(expert_names),
-                    lat=lat,
-                    lon=lon,
-                    build_split="train",
-                    expert_source=cfg.expert_source,
+            mae = np.where(valid, mae, np.nan).astype('f4')
+            temporary = str(cache_path)+'.tmp'
+            with open(temporary, 'wb') as stream:
+                np.savez(stream, signature=signature, prior_logits=logits,
+                    prior_confidence=confidence, expert_names=np.asarray(expert_names),
+                    lat=lat, lon=lon, build_split='train', expert_source=cfg.expert_source,
                     stage1_checkpoint_sha256=cfg.stage1_checkpoint_sha256,
-                    counts=raw_counts,
-                    freq=freq,
-                    weights=weights,
-                    mae=mae,
-                    observation_count=support.astype("i8"),
-                )
+                    counts=raw_counts, freq=freq, weights=weights,
+                    mae=mae, observation_count=support.astype('i8'))
             os.replace(temporary, cache_path)
-            print("Saved generated-expert TRAIN statistics:", cache_path)
+            print('Saved generated-expert TRAIN statistics:', cache_path)
     elif rank == 0:
-        print("Reusing generated-expert TRAIN statistics:", cache_path)
+        print('Reusing generated-expert TRAIN statistics:', cache_path)
     barrier()
     with np.load(cache_path) as cached:
-        weights = cached["weights"].astype("f4")
+        weights = cached['weights'].astype('f4')
+        cfg.generated_statistics_origin = dict(
+            policy='fixed_compatible_historical_prior', cache_path=str(cache_path.resolve()),
+            stage1_checkpoint_sha256=str(cached['stage1_checkpoint_sha256'].item()),
+            signature=str(cached['signature'].item()))
     return weights
 
 
@@ -1342,7 +1352,8 @@ def parse_stage2_config():
         action="store_true",
         help="Autocast the frozen encoder AND expert decoders.",
     )
-    parser.add_argument("--recompute-class-weights", action="store_true")
+    parser.add_argument("--recompute-class-weights", action="store_true",
+        help="Explicitly rebuild the fixed historical expert prior and class weights.")
     args = parser.parse_args()
     if min(args.batch_size, args.epochs) < 1 or args.workers < 0:
         parser.error("batch-size/epochs must be positive; workers must be nonnegative.")
