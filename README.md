@@ -3,7 +3,7 @@
 **Global probabilistic ocean-wave forecasting with physically diverse experts and satellite-observation constraints.**
 
 <p align="center">
-  <img src="assets/architecture.png" width="95%">
+  <img src="assets/framework.png" width="95%">
 </p>
 
 WavePrism learns from multiple physically diverse wave-model experts and observational constraints to produce global probabilistic significant-wave-height predictions. This repository organizes the model, training stages, data readers, and inference workflows as a Python package.
